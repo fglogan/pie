@@ -2,11 +2,12 @@
 
 ## Project Structure & Module Organization
 
-This repository is a Rust 2024 Cargo workspace. The root `Cargo.toml` lists three members:
+This repository is a Rust 2024 Cargo workspace. The root `Cargo.toml` lists four members:
 
 - `crates/ai`: `pie-ai`, the unified streaming LLM client, provider integrations, OAuth helpers, model catalogs, and utilities.
 - `crates/agent`: `pie-agent-core`, the agent runtime, harness, session storage, skills loading, compaction, and lifecycle hooks.
 - `crates/coding-agent`: `pie-coding-agent`, the `pie` CLI binary, REPL TUI, tools, config, and session handling.
+- `crates/mcp`: `pie-mcp`, the minimal MCP client (stdio transport, JSON-RPC framing, `tools/list` / `tools/call`).
 
 Each crate keeps implementation in `src/`, integration tests in `tests/`, and runnable examples in `examples/` where present. Provider model data and generated Rust live under `crates/ai/src/`; use `crates/ai/scripts/regen_models.sh` when regenerating model catalogs.
 

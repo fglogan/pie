@@ -5,6 +5,41 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ## [Unreleased]
 
+### Fixed — robustness
+
+- Sessions: a crash mid-append no longer makes a session impossible to resume. A torn final
+  JSONL line is skipped on load (with a warning) and truncated on the next append; appends are
+  now `fsync`ed. Malformed lines elsewhere are still reported as `Corrupted`.
+- Sessions: removed quadratic I/O. Appends update an in-memory index (entries by id + current
+  leaf) instead of invalidating it, so `set_leaf_id` / `get_entry` / `get_path_to_root` no
+  longer re-read and re-parse the whole file. The cache revalidates against the file length,
+  so writes from another handle or process are still picked up.
+- `bash` tool: non-UTF-8 output is decoded lossily instead of silently dropping the whole
+  stream; capture is bounded to the most recent 512 KiB per stream (with a note saying how
+  much was dropped); output already read is kept when a backgrounded descendant holds the pipe
+  open; commands get a default 600 s timeout (`PIE_BASH_TIMEOUT_SECS`, `0` disables; the model
+  can pass `timeout: 0` for long builds).
+- `edit` / `write` tools: writes are atomic (temp file + `fsync` + rename), preserve the
+  existing file mode and follow symlinks, so a crash or full disk can no longer truncate a
+  source file.
+- `fs_guard`: per-file lock entries are released after use instead of accumulating forever.
+- SSE parser: a final event that is not newline-terminated at EOF is no longer dropped.
+- Tests: every env-mutating unit test in a crate shares one poison-tolerant lock (Vertex and
+  Bedrock tests previously had none), removing a source of flaky `set_var` races.
+
+### Changed — models
+
+- Regenerated the model catalog from upstream `@earendil-works/pi-ai@0.99.1` (938 → 1495
+  models: Claude Opus 5 / 5.5, Sonnet 5 / 5.5, Fable 5 / 5.1, GPT-5.6 / 6 / 6.1, Gemini 3.x,
+  new providers such as Baseten, NVIDIA, Meta and Qwen token plans). `regen_models.sh` now
+  pulls the published npm package and keeps only models on APIs pie implements.
+- Anthropic provider: models flagged `forceAdaptiveThinking` (Opus/Sonnet 4.6+, Fable 5) now
+  get adaptive thinking with an `output_config.effort` instead of a token budget; managed
+  effort models (`supportsMidConvoEffort`) always use adaptive thinking; `temperature` is not
+  sent to models that reject it.
+- Default Google model is now `gemini-2.5-flash` (`gemini-2.0-flash` left the catalog).
+
+
 ### Removed
 
 - Removed the experimental public cross-agent messaging service from the shipped client

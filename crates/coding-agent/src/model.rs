@@ -13,8 +13,8 @@ const CANDIDATES: &[(&str, &str, &str)] = &[
     ("OPENROUTER_API_KEY", "openrouter", "openai/gpt-4o-mini"),
     ("GROQ_API_KEY", "groq", "llama-3.3-70b-versatile"),
     ("MISTRAL_API_KEY", "mistral", "mistral-large-latest"),
-    ("GEMINI_API_KEY", "google", "gemini-2.0-flash"),
-    ("GOOGLE_API_KEY", "google", "gemini-2.0-flash"),
+    ("GEMINI_API_KEY", "google", "gemini-2.5-flash"),
+    ("GOOGLE_API_KEY", "google", "gemini-2.5-flash"),
 ];
 
 /// Returns the resolved model + provider id of the chosen entry. If the catalog doesn't

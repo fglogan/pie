@@ -8,11 +8,15 @@
 //! - `cache_control` markers on system, last user content, and last tool def
 //! - Long-cache retention TTL (`ttl: "1h"`) via `cache_retention: long`
 //! - Budget-based thinking from `provider_extras.thinking` or `SimpleStreamOptions.reasoning`
+//! - Adaptive thinking + `output_config.effort` for models flagged `forceAdaptiveThinking`
+//!   (Opus/Sonnet 4.6+, Fable 5), always-on adaptive thinking for managed-effort models
+//!   (`supportsMidConvoEffort`), and no `temperature` where `supportsTemperature` is false
 //! - Compat overrides (Fireworks etc. disable eager-stream + cache_control on tools)
 //! - Tool name preservation (no Claude-Code "stealth" rename — that lives in the harness)
 //!
 //! TODO:
-//! - Adaptive thinking (Opus 4.6+/Sonnet 4.6) with `effort` knob
+//! - Mid-conversation effort changes (managed-effort system messages) for
+//!   `supportsMidConvoEffort` models; pie pins the effort for the whole request instead
 //! - Interleaved-thinking beta toggle
 //! - OAuth bearer-token auth path
 //! - `redacted_thinking` content blocks
@@ -50,6 +54,12 @@ struct Compat {
     supports_cache_control_on_tools: bool,
     #[allow(dead_code)]
     supports_eager_tool_input_streaming: bool,
+    /// Model rejects budget-based thinking; use `{"type":"adaptive"}` + an effort level.
+    force_adaptive_thinking: bool,
+    /// Managed-effort model: thinking is always adaptive and cannot be switched off.
+    managed_effort: bool,
+    /// Model accepts `temperature` (false on Opus 4.7+).
+    supports_temperature: bool,
 }
 
 fn resolve_compat(model: &Model) -> Compat {
@@ -78,7 +88,76 @@ fn resolve_compat(model: &Model) -> Compat {
             "supportsEagerToolInputStreaming",
             !is_fireworks,
         ),
+        force_adaptive_thinking: read_bool("forceAdaptiveThinking", false)
+            || read_bool("supportsMidConvoEffort", false),
+        managed_effort: read_bool("supportsMidConvoEffort", false),
+        supports_temperature: read_bool("supportsTemperature", true),
     }
+}
+
+/// Map a pi thinking level to an Anthropic adaptive-thinking effort. The model's
+/// `thinkingLevelMap` wins when it names a value (e.g. native `xhigh`); otherwise fall back to
+/// the conservative mapping upstream uses. Mirrors TS `mapThinkingLevelToEffort`.
+fn effort_for(model: &Model, level: ThinkingLevel) -> String {
+    let key = match level {
+        ThinkingLevel::Minimal => ModelThinkingLevel::Minimal,
+        ThinkingLevel::Low => ModelThinkingLevel::Low,
+        ThinkingLevel::Medium => ModelThinkingLevel::Medium,
+        ThinkingLevel::High => ModelThinkingLevel::High,
+        ThinkingLevel::Xhigh => ModelThinkingLevel::Xhigh,
+    };
+    if let Some(Some(mapped)) = model.thinking_level_map.as_ref().and_then(|m| m.get(&key)) {
+        return mapped.clone();
+    }
+    match level {
+        ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High | ThinkingLevel::Xhigh => "high",
+    }
+    .to_string()
+}
+
+/// Translate the universal `SimpleStreamOptions` into Anthropic `provider_extras`.
+fn translate_simple_options(model: &Model, options: Option<&SimpleStreamOptions>) -> StreamOptions {
+    let compat = resolve_compat(model);
+    let mut base = options.map(|o| o.base.clone()).unwrap_or_default();
+    let reasoning = options.and_then(|o| o.reasoning);
+    let adaptive = |effort: String| {
+        let mut thinking = json!({ "type": "adaptive", "display": "summarized" });
+        if compat.managed_effort {
+            // What upstream sends for managed-effort models so a thinking-block prefix
+            // mismatch is dropped instead of failing every later request with a 400.
+            thinking["block_binding"] = json!({ "prefix_mismatch_behavior": "drop_block" });
+        }
+        (thinking, json!({ "effort": effort }))
+    };
+    match reasoning {
+        Some(level) if compat.force_adaptive_thinking => {
+            let (thinking, output_config) = adaptive(effort_for(model, level));
+            base.provider_extras.insert("thinking".into(), thinking);
+            base.provider_extras
+                .insert("output_config".into(), output_config);
+        }
+        Some(level) => {
+            let budget = options
+                .and_then(|o| o.thinking_budgets.as_ref())
+                .and_then(|b| budget_for(b, level))
+                .unwrap_or(default_budget_for(level));
+            base.provider_extras.insert(
+                "thinking".to_string(),
+                json!({ "type": "enabled", "budget_tokens": budget }),
+            );
+        }
+        None if compat.managed_effort => {
+            // Thinking cannot be disabled on these models; pin the default effort.
+            let (thinking, output_config) = adaptive("high".into());
+            base.provider_extras.insert("thinking".into(), thinking);
+            base.provider_extras
+                .insert("output_config".into(), output_config);
+        }
+        None => {}
+    }
+    base
 }
 
 /// Anthropic-specific opts mirror `AnthropicOptions` on the TS side. Threaded through
@@ -129,23 +208,7 @@ impl ApiProvider for AnthropicProvider {
         context: &Context,
         options: Option<&SimpleStreamOptions>,
     ) -> AssistantMessageEventStream {
-        let translated = options
-            .map(|o| {
-                let mut base = o.base.clone();
-                if let Some(level) = o.reasoning {
-                    let budget = o
-                        .thinking_budgets
-                        .as_ref()
-                        .and_then(|b| budget_for(b, level))
-                        .unwrap_or(default_budget_for(level));
-                    base.provider_extras.insert(
-                        "thinking".to_string(),
-                        json!({ "type": "enabled", "budget_tokens": budget }),
-                    );
-                }
-                base
-            })
-            .unwrap_or_default();
+        let translated = translate_simple_options(model, options);
         self.stream(model, context, Some(&translated))
     }
 }
@@ -601,16 +664,19 @@ fn build_request_body(
         body["system"] = json!([sys_block]);
     }
 
-    let thinking_enabled = options
-        .provider_extras
-        .get("thinking")
-        .and_then(|v| v.get("type"))
-        .and_then(|v| v.as_str())
-        == Some("enabled");
+    let thinking_enabled = matches!(
+        options
+            .provider_extras
+            .get("thinking")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("enabled" | "adaptive")
+    );
 
     if let Some(t) = options.temperature {
-        // Anthropic rejects temperature when extended thinking is enabled.
-        if !thinking_enabled {
+        // Anthropic rejects temperature when extended/adaptive thinking is on, and some models
+        // (Opus 4.7+, managed-effort models) reject it outright.
+        if !thinking_enabled && compat.supports_temperature && !compat.managed_effort {
             body["temperature"] = json!(t);
         }
     }
@@ -620,6 +686,9 @@ fn build_request_body(
     }
     if let Some(thinking) = options.provider_extras.get("thinking") {
         body["thinking"] = thinking.clone();
+    }
+    if let Some(output_config) = options.provider_extras.get("output_config") {
+        body["output_config"] = output_config.clone();
     }
     if let Some(meta) = &options.metadata {
         if let Some(user_id) = meta.get("user_id") {
@@ -885,6 +954,133 @@ mod tests {
             "temperature must be dropped"
         );
         assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    fn adaptive_model(compat: Value) -> Model {
+        let mut m = mk_model();
+        m.id = "claude-opus-5-5".into();
+        m.reasoning = true;
+        m.compat = Some(compat);
+        m.thinking_level_map = Some(
+            [
+                (ModelThinkingLevel::Xhigh, Some("xhigh".to_string())),
+                (ModelThinkingLevel::Minimal, None),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        m
+    }
+
+    fn hi_ctx() -> Context {
+        Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Text("hi".into()),
+                timestamp: 0,
+            })],
+            tools: None,
+        }
+    }
+
+    fn simple(reasoning: Option<ThinkingLevel>, temperature: Option<f32>) -> SimpleStreamOptions {
+        SimpleStreamOptions {
+            base: StreamOptions {
+                temperature,
+                ..Default::default()
+            },
+            reasoning,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn legacy_models_keep_budget_thinking() {
+        let m = mk_model();
+        let opts = translate_simple_options(&m, Some(&simple(Some(ThinkingLevel::Medium), None)));
+        let body = build_request_body(&m, &hi_ctx(), &opts, &resolve_compat(&m)).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 8192);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn force_adaptive_models_use_effort_not_budget() {
+        let m = adaptive_model(json!({ "forceAdaptiveThinking": true }));
+        let c = resolve_compat(&m);
+
+        let opts =
+            translate_simple_options(&m, Some(&simple(Some(ThinkingLevel::Xhigh), Some(0.3))));
+        let body = build_request_body(&m, &hi_ctx(), &opts, &c).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert!(body["thinking"].get("block_binding").is_none());
+        assert_eq!(
+            body["output_config"]["effort"], "xhigh",
+            "native level from the map"
+        );
+        assert!(
+            body.get("temperature").is_none(),
+            "no temperature with thinking on"
+        );
+
+        // `minimal` is marked unsupported (null) in the map -> conservative fallback.
+        let opts = translate_simple_options(&m, Some(&simple(Some(ThinkingLevel::Minimal), None)));
+        let body = build_request_body(&m, &hi_ctx(), &opts, &c).unwrap();
+        assert_eq!(body["output_config"]["effort"], "low");
+
+        // Reasoning off: nothing thinking-related is sent, temperature passes through.
+        let opts = translate_simple_options(&m, Some(&simple(None, Some(0.3))));
+        let body = build_request_body(&m, &hi_ctx(), &opts, &c).unwrap();
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("temperature").is_some());
+    }
+
+    #[test]
+    fn managed_effort_models_always_think_and_never_send_temperature() {
+        let m = adaptive_model(json!({
+            "forceAdaptiveThinking": true,
+            "supportsMidConvoEffort": true,
+            "supportsTemperature": false,
+        }));
+        let c = resolve_compat(&m);
+        let opts = translate_simple_options(&m, Some(&simple(None, Some(0.3))));
+        let body = build_request_body(&m, &hi_ctx(), &opts, &c).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(
+            body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block"
+        );
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn temperature_suppressed_when_model_does_not_support_it() {
+        let m =
+            adaptive_model(json!({ "forceAdaptiveThinking": true, "supportsTemperature": false }));
+        let opts = translate_simple_options(&m, Some(&simple(None, Some(0.3))));
+        let body = build_request_body(&m, &hi_ctx(), &opts, &resolve_compat(&m)).unwrap();
+        assert!(body.get("temperature").is_none());
+    }
+
+    /// Every Anthropic model the shipped catalog flags as adaptive-only must actually get
+    /// adaptive thinking (guards against the catalog and provider drifting apart again).
+    #[test]
+    fn catalog_adaptive_models_get_adaptive_requests() {
+        let adaptive: Vec<Model> = crate::models::list_models()
+            .into_iter()
+            .filter(|m| m.api == Api::known(KnownApi::AnthropicMessages))
+            .filter(|m| resolve_compat(m).force_adaptive_thinking)
+            .collect();
+        assert!(!adaptive.is_empty());
+        for m in adaptive {
+            let opts = translate_simple_options(&m, Some(&simple(Some(ThinkingLevel::High), None)));
+            let body = build_request_body(&m, &hi_ctx(), &opts, &resolve_compat(&m)).unwrap();
+            assert_eq!(body["thinking"]["type"], "adaptive", "{}", m.id);
+            assert!(body["output_config"]["effort"].is_string(), "{}", m.id);
+        }
     }
 
     #[test]

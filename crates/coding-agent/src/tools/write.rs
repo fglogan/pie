@@ -1,6 +1,6 @@
 //! `write` tool. Mirrors `packages/coding-agent/src/core/tools/write.ts` — full-file overwrite
-//! with parent-directory creation. Simpler than TS (no atomic temp-file + rename, no diff
-//! preview); good enough for the simple agent.
+//! with parent-directory creation. Like the TS original, the overwrite is atomic (temp file +
+//! `fsync` + rename via `fs_guard::write_atomic`); there is no diff preview.
 
 use async_trait::async_trait;
 use pie_agent_core::{AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate};
@@ -44,7 +44,7 @@ impl AgentTool for WriteTool {
                     let _ = tokio::fs::create_dir_all(parent).await;
                 }
             }
-            tokio::fs::write(path, content.as_bytes())
+            crate::tools::fs_guard::write_atomic(std::path::Path::new(path), content.as_bytes())
                 .await
                 .map_err(|e| AgentToolError::from(format!("write {path}: {e}")))
         })

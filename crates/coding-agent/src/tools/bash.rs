@@ -17,13 +17,23 @@
 //!    `(sleep 60) & wait`. Same pattern as `NativeEnv::exec` in `crates/agent` (PR #40).
 //! 3. **`kill_on_drop(true)` is the belt-and-braces backstop**. If any branch returns early
 //!    without an explicit `child.kill().await`, the destructor still reaps the child.
+//! 4. **Output capture is bounded and lossless in encoding.** Each stream keeps only its most
+//!    recent [`CAPTURE_CAP_BYTES`] bytes (the renderer tail-truncates anyway), so a runaway
+//!    command cannot exhaust memory. Bytes are decoded lossily, so non-UTF-8 output (binary
+//!    data, legacy encodings) shows up with replacement characters instead of being silently
+//!    discarded. Capture goes into shared buffers, so whatever was read before the drain
+//!    window closes (e.g. a backgrounded descendant still holding the pipe) is kept.
+//! 5. **Commands always have a deadline.** When the model omits `timeout`, the default from
+//!    `PIE_BASH_TIMEOUT_SECS` (or [`DEFAULT_TIMEOUT_SECS`]) applies; `0` disables it. A hung
+//!    command can therefore no longer wedge an unattended loop / cron run forever.
 
 use async_trait::async_trait;
 use pie_agent_core::{AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate};
 use pie_ai::{Tool, UserContentBlock};
 use serde_json::{Value, json};
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -31,12 +41,89 @@ use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 
 pub struct BashTool;
 
+/// Default command deadline when the model does not pass `timeout`.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
+/// Env override for [`DEFAULT_TIMEOUT_SECS`]; `0` means "no default timeout".
+pub const TIMEOUT_ENV: &str = "PIE_BASH_TIMEOUT_SECS";
+/// Per-stream capture ceiling. Twice the render budget so `truncate_tail` still has whole
+/// lines to work with after the capture window drops the oldest bytes.
+pub const CAPTURE_CAP_BYTES: usize = 2 * DEFAULT_MAX_BYTES;
+
+fn default_timeout_secs() -> Option<u64> {
+    let secs = std::env::var(TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    (secs > 0).then_some(secs)
+}
+
+/// Tail-only capture of one output stream.
+#[derive(Default)]
+struct Capture {
+    buf: Vec<u8>,
+    total: u64,
+}
+
+impl Capture {
+    fn push(&mut self, chunk: &[u8]) {
+        self.total += chunk.len() as u64;
+        self.buf.extend_from_slice(chunk);
+        // Amortize: only compact once we are well past the cap.
+        if self.buf.len() > 2 * CAPTURE_CAP_BYTES {
+            let excess = self.buf.len() - CAPTURE_CAP_BYTES;
+            self.buf.drain(..excess);
+        }
+    }
+
+    /// Decode the retained tail. Returns the text plus how many leading bytes were dropped.
+    fn finish(mut self) -> (String, u64) {
+        if self.buf.len() > CAPTURE_CAP_BYTES {
+            let excess = self.buf.len() - CAPTURE_CAP_BYTES;
+            self.buf.drain(..excess);
+        }
+        let mut kept: &[u8] = &self.buf;
+        let dropped = self.total - kept.len() as u64;
+        if dropped > 0 {
+            // Start at a line boundary rather than mid-line / mid-codepoint.
+            if let Some(nl) = kept.iter().position(|&b| b == b'\n') {
+                if nl + 1 < kept.len() {
+                    kept = &kept[nl + 1..];
+                }
+            }
+        }
+        let dropped = self.total - kept.len() as u64;
+        (String::from_utf8_lossy(kept).into_owned(), dropped)
+    }
+}
+
+type SharedCapture = Arc<Mutex<Capture>>;
+
+async fn drain_into<R: AsyncRead + Unpin>(mut reader: R, sink: SharedCapture) {
+    let mut chunk = vec![0u8; 16 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => sink
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(&chunk[..n]),
+        }
+    }
+}
+
+fn take_capture(c: &SharedCapture) -> (String, u64) {
+    std::mem::take(&mut *c.lock().unwrap_or_else(|p| p.into_inner())).finish()
+}
+
 /// What we collected from a single run, regardless of whether the child finished cleanly,
 /// timed out, or was cancelled. Each variant carries the captured output so the LLM still
 /// sees what the command produced before the kill.
 struct RunOutcome {
     stdout: String,
     stderr: String,
+    /// Bytes dropped from the front of each stream by the bounded capture.
+    stdout_dropped: u64,
+    stderr_dropped: u64,
     /// Process exit code, when the child exited normally on its own. `None` when we killed
     /// the child (timeout / cancel) — those branches surface as exit code -1 in the rendered
     /// output and add a `[timed out ...]` / `[aborted]` marker to stderr.
@@ -72,7 +159,12 @@ impl AgentTool for BashTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentToolError::from("missing `command`"))?;
-        let timeout_secs = params.get("timeout").and_then(|v| v.as_u64());
+        // Explicit `timeout` wins (0 = no limit); otherwise apply the default deadline.
+        let timeout_secs = match params.get("timeout").and_then(|v| v.as_u64()) {
+            Some(0) => None,
+            Some(secs) => Some(secs),
+            None => default_timeout_secs(),
+        };
 
         let outcome = run_with_kill_on_timeout_or_cancel(command, timeout_secs, &cancel).await?;
 
@@ -88,6 +180,12 @@ impl AgentTool for BashTool {
         }
         let (stderr_trim, _) = truncate_tail(&stderr_full, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
         let mut text = format!("$ {command}\n");
+        if outcome.stdout_dropped > 0 {
+            text.push_str(&format!(
+                "[output truncated: dropped the first {} bytes of stdout]\n",
+                outcome.stdout_dropped
+            ));
+        }
         if let Some(note) = st.note() {
             text.push_str(&note);
             text.push('\n');
@@ -100,6 +198,12 @@ impl AgentTool for BashTool {
         }
         if !stderr_trim.is_empty() {
             text.push_str("[stderr]\n");
+            if outcome.stderr_dropped > 0 {
+                text.push_str(&format!(
+                    "[output truncated: dropped the first {} bytes of stderr]\n",
+                    outcome.stderr_dropped
+                ));
+            }
             text.push_str(&stderr_trim);
             if !stderr_trim.ends_with('\n') {
                 text.push('\n');
@@ -173,23 +277,24 @@ async fn run_with_kill_on_timeout_or_cancel(
     // of stderr.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let drain_handle = tokio::spawn(async move {
-        let stdout_task = async move {
-            let mut s = String::new();
-            if let Some(mut h) = stdout {
-                let _ = h.read_to_string(&mut s).await;
-            }
-            s
-        };
-        let stderr_task = async move {
-            let mut s = String::new();
-            if let Some(mut h) = stderr {
-                let _ = h.read_to_string(&mut s).await;
-            }
-            s
-        };
-        tokio::join!(stdout_task, stderr_task)
-    });
+    let out_buf: SharedCapture = Arc::default();
+    let err_buf: SharedCapture = Arc::default();
+    let drain_handle = {
+        let (out_buf, err_buf) = (out_buf.clone(), err_buf.clone());
+        tokio::spawn(async move {
+            let stdout_task = async move {
+                if let Some(h) = stdout {
+                    drain_into(h, out_buf).await;
+                }
+            };
+            let stderr_task = async move {
+                if let Some(h) = stderr {
+                    drain_into(h, err_buf).await;
+                }
+            };
+            tokio::join!(stdout_task, stderr_task);
+        })
+    };
 
     // Race three outcomes:
     //   1. Child finishes on its own — record the exit code, drain finishes shortly.
@@ -244,12 +349,17 @@ async fn run_with_kill_on_timeout_or_cancel(
     }
 
     // The drain task should be done — pipes close when the child exits. Cap with a short
-    // timeout in case the kernel hasn't surfaced the EOF yet on a wedged child.
-    let drain_result = timeout(Duration::from_secs(2), drain_handle).await;
-    let (stdout, stderr) = match drain_result {
-        Ok(Ok((o, e))) => (o, e),
-        _ => (String::new(), String::new()),
-    };
+    // timeout in case a descendant (e.g. `server &`) still holds the pipe open; whatever was
+    // captured up to that point is kept either way.
+    let mut drain_handle = drain_handle;
+    if timeout(Duration::from_secs(2), &mut drain_handle)
+        .await
+        .is_err()
+    {
+        drain_handle.abort();
+    }
+    let (stdout, stdout_dropped) = take_capture(&out_buf);
+    let (stderr, stderr_dropped) = take_capture(&err_buf);
 
     let stderr_suffix = match kill_reason {
         KillReason::Finished => None,
@@ -260,6 +370,8 @@ async fn run_with_kill_on_timeout_or_cancel(
     Ok(RunOutcome {
         stdout,
         stderr,
+        stdout_dropped,
+        stderr_dropped,
         exit_code,
         stderr_suffix,
     })
@@ -298,14 +410,15 @@ use once_cell::sync::Lazy;
 static DEFINITION: Lazy<Tool> = Lazy::new(|| Tool {
     name: "bash".into(),
     description: format!(
-        "Run a shell command via `sh -c`. Returns stdout+stderr (tail-truncated to {DEFAULT_MAX_LINES} lines / {} KiB) and exit code. Optional `timeout` in seconds. Timeouts and cancellations kill the child process; stdout and stderr are drained concurrently so high-output commands do not deadlock the tool.",
-        DEFAULT_MAX_BYTES / 1024
+        "Run a shell command via `sh -c`. Returns stdout+stderr (tail-truncated to {DEFAULT_MAX_LINES} lines / {} KiB) and exit code. Optional `timeout` in seconds (default {}s; pass 0 for no limit, e.g. for long builds). Timeouts and cancellations kill the child process tree; stdout and stderr are drained concurrently so high-output commands do not deadlock the tool.",
+        DEFAULT_MAX_BYTES / 1024,
+        default_timeout_secs().unwrap_or(0)
     ),
     parameters: json!({
         "type": "object",
         "properties": {
             "command": { "type": "string", "description": "Shell command to execute" },
-            "timeout": { "type": "integer", "description": "Timeout in seconds (optional). On timeout the child is killed and any output captured so far is returned." },
+            "timeout": { "type": "integer", "description": "Timeout in seconds (optional; defaults to the configured limit, 0 disables it). On timeout the child is killed and any output captured so far is returned." },
         },
         "required": ["command"],
     }),
@@ -516,6 +629,106 @@ mod tests {
         );
         // stderr marker should appear because we wrote a lot to it.
         assert!(text.contains("[stderr]"));
+    }
+
+    fn text_of(r: &AgentToolResult) -> String {
+        match &r.content[0] {
+            UserContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// Non-UTF-8 bytes used to make `read_to_string` fail and the whole stream vanish.
+    #[tokio::test]
+    async fn non_utf8_output_is_kept_lossily() {
+        let r = BashTool
+            .execute(
+                "u1",
+                json!({ "command": "printf 'before\\377after\\n'; printf 'err\\376x\\n' 1>&2" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&r);
+        assert!(text.contains("before\u{FFFD}after"), "got: {text}");
+        assert!(text.contains("err\u{FFFD}x"), "got: {text}");
+        assert!(text.contains("[exit 0]"));
+    }
+
+    /// Output far beyond the capture cap must not be buffered in full and must say what was
+    /// dropped; the tail (most recent output) is what survives.
+    #[tokio::test]
+    async fn huge_output_is_bounded_and_keeps_tail() {
+        let r = BashTool
+            .execute(
+                "u2",
+                json!({ "command": "seq 1 400000; echo LAST-LINE-MARKER" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&r);
+        assert!(text.contains("LAST-LINE-MARKER"));
+        assert!(
+            text.contains("[output truncated: dropped the first"),
+            "got head: {}",
+            &text[..200.min(text.len())]
+        );
+        assert!(text.len() < 2 * CAPTURE_CAP_BYTES);
+    }
+
+    /// A background job that keeps the pipe open used to make the drain time out and throw
+    /// away *all* output. Now what was printed before is still returned.
+    #[tokio::test]
+    async fn output_survives_descendant_holding_pipe_open() {
+        let marker = "bash-tool-pipe-holder-5e1d";
+        let r = BashTool
+            .execute(
+                "u3",
+                json!({ "command": format!("echo visible-output; (sleep 30; echo {marker}) &") }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&r);
+        assert!(text.contains("visible-output"), "got: {text}");
+        // Clean up the detached sleeper so it does not outlive the test run.
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg(marker)
+            .status();
+    }
+
+    #[test]
+    fn capture_keeps_tail_on_line_boundary() {
+        let mut c = Capture::default();
+        for i in 0..200_000 {
+            c.push(format!("line {i}\n").as_bytes());
+        }
+        let (text, dropped) = c.finish();
+        assert!(dropped > 0);
+        assert!(text.starts_with("line "), "should start on a line boundary");
+        assert!(text.ends_with("line 199999\n"));
+        assert!(text.len() <= CAPTURE_CAP_BYTES);
+    }
+
+    #[test]
+    fn default_timeout_honors_env() {
+        let _g = crate::auth::env_lock();
+        let prev = std::env::var_os(TIMEOUT_ENV);
+        // SAFETY: serialized by ENV_LOCK with every other env-mutating test in this crate.
+        unsafe { std::env::set_var(TIMEOUT_ENV, "0") };
+        assert_eq!(default_timeout_secs(), None);
+        unsafe { std::env::set_var(TIMEOUT_ENV, "42") };
+        assert_eq!(default_timeout_secs(), Some(42));
+        unsafe { std::env::remove_var(TIMEOUT_ENV) };
+        assert_eq!(default_timeout_secs(), Some(DEFAULT_TIMEOUT_SECS));
+        if let Some(v) = prev {
+            unsafe { std::env::set_var(TIMEOUT_ENV, v) };
+        }
     }
 
     /// Sanity: a small, fast command still works the same as before.

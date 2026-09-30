@@ -76,7 +76,7 @@ impl AgentTool for EditTool {
                 } else {
                     body.replacen(old, new_, 1)
                 };
-                tokio::fs::write(path, new_body.as_bytes())
+                crate::tools::fs_guard::write_atomic(std::path::Path::new(path), new_body.as_bytes())
                     .await
                     .map_err(|e| AgentToolError::from(format!("write {path}: {e}")))?;
                 Ok(occurrences)

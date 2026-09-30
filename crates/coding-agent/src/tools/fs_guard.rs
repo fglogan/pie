@@ -68,14 +68,85 @@ where
 {
     let key = lock_key(path).await;
     let lock = {
-        let mut reg = REGISTRY.lock().expect("file-lock registry poisoned");
+        let mut reg = registry();
         Arc::clone(
-            reg.entry(key)
+            reg.entry(key.clone())
                 .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
         )
     };
-    let _guard = lock.lock().await;
-    f().await
+    let out = {
+        let _guard = lock.lock().await;
+        f().await
+    };
+    // Drop the registry entry once nobody else holds or waits on it, so a long-running
+    // session that touches many files does not grow the map without bound. Waiters hold
+    // their own `Arc` clone, so a count of 2 (registry + ours) means we are the last user.
+    // Clones are only taken under the registry mutex, which we hold here, so the count cannot
+    // race upward between the check and the removal.
+    let mut reg = registry();
+    if Arc::strong_count(&lock) == 2 && reg.get(&key).is_some_and(|l| Arc::ptr_eq(l, &lock)) {
+        reg.remove(&key);
+    }
+    out
+}
+
+fn registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<AsyncMutex<()>>>> {
+    // The map holds no invariants a panic could break; recover instead of cascading panics.
+    REGISTRY.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Replace `path`'s contents atomically: write a sibling temp file, `fsync` it, then `rename`
+/// it over the target. A crash, full disk or kill mid-write leaves either the old or the new
+/// contents, never a truncated file. Symlinks are followed (the link target is replaced, the
+/// link itself is kept) and an existing file's permission bits are preserved.
+///
+/// Callers should hold [`with_file_lock`] for `path`.
+pub async fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    // Resolve a symlinked target so we replace the file it points at, not the link.
+    let target = match tokio::fs::canonicalize(path).await {
+        Ok(real) => real,
+        Err(_) => path.to_path_buf(),
+    };
+    let existing_perms = tokio::fs::metadata(&target)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+
+    let dir = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let tmp = dir.join(format!(".{name}.pie-tmp-{}", uuid::Uuid::new_v4().simple()));
+
+    let result = async {
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut f, contents).await?;
+        f.sync_all().await?;
+        drop(f);
+        if let Some(perms) = existing_perms {
+            tokio::fs::set_permissions(&tmp, perms).await?;
+        }
+        tokio::fs::rename(&tmp, &target).await?;
+        // Persist the rename itself (best effort; not supported on every platform/filesystem).
+        #[cfg(unix)]
+        if let Ok(d) = tokio::fs::File::open(&dir).await {
+            let _ = d.sync_all().await;
+        }
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -118,6 +189,88 @@ mod tests {
             1,
             "at most one critical section may run at a time for the same file"
         );
+    }
+
+    /// The registry must not keep an entry per file forever.
+    #[tokio::test]
+    async fn registry_entries_are_released() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("released.txt");
+        std::fs::write(&p, "x").unwrap();
+        let key = lock_key(&p).await;
+        with_file_lock(&p, || async {
+            assert!(registry().contains_key(&key));
+        })
+        .await;
+        assert!(
+            !registry().contains_key(&key),
+            "entry should be dropped after use"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_atomic_replaces_contents_and_keeps_mode() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("script.sh");
+        std::fs::write(&p, "old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        write_atomic(&p, b"new contents").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new contents");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+        // No temp files left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".pie-tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_atomic_follows_symlink() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&real, "old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_atomic(&link, b"new").await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn write_atomic_failure_leaves_original_untouched() {
+        let dir = tempdir().unwrap();
+        // Target is a directory: rename over it fails, the temp file must be cleaned up.
+        let target = dir.path().join("adir");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "keep").unwrap();
+        assert!(write_atomic(&target, b"x").await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".pie-tmp-"))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     /// Different files are not blocked by each other.

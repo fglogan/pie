@@ -91,7 +91,14 @@ where
                 return Poll::Ready(Some(Ok(ev)));
             }
             if self.upstream_done {
+                // A stream may end without the terminating newline(s). Treat EOF as ending the
+                // last line and the last event instead of silently dropping them.
+                if !self.buf.is_empty() {
+                    self.buf.extend_from_slice(b"\n");
+                    self.drain_lines();
+                }
                 self.flush_current();
+                self.pending.reverse();
                 if let Some(ev) = self.pending.pop() {
                     return Poll::Ready(Some(Ok(ev)));
                 }
@@ -112,5 +119,51 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    async fn collect(chunks: &[&'static str]) -> Vec<SseEvent> {
+        let body = futures::stream::iter(
+            chunks
+                .iter()
+                .map(|c| Ok::<_, reqwest::Error>(Bytes::from_static(c.as_bytes())))
+                .collect::<Vec<_>>(),
+        );
+        SseStream::new(body)
+            .map(|r| r.expect("no transport errors in fixture"))
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn events_split_across_chunks_arrive_in_order() {
+        let evs = collect(&["event: a\ndata: 1\n\nevent: b\nda", "ta: 2\n\ndata: 3\n\n"]).await;
+        let got: Vec<_> = evs
+            .iter()
+            .map(|e| (e.event.as_deref(), e.data.as_str()))
+            .collect();
+        assert_eq!(got, [(Some("a"), "1"), (Some("b"), "2"), (None, "3")]);
+    }
+
+    #[tokio::test]
+    async fn final_event_without_trailing_newline_is_not_dropped() {
+        let evs = collect(&["data: first\n\n", "event: done\ndata: last"]).await;
+        let got: Vec<_> = evs
+            .iter()
+            .map(|e| (e.event.as_deref(), e.data.as_str()))
+            .collect();
+        assert_eq!(got, [(None, "first"), (Some("done"), "last")]);
+    }
+
+    #[tokio::test]
+    async fn multiline_data_and_comments() {
+        let evs = collect(&[": keepalive\ndata: a\r\ndata: b\r\n\r\n"]).await;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "a\nb");
     }
 }

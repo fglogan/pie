@@ -15,8 +15,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::base_dir;
 
+/// Serializes every unit test in this binary that mutates process env vars (auth, commands,
+/// local models, otlp, bash, ...). Use [`env_lock`] so a panicking test does not poison the
+/// lock for all the others.
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 pub fn auth_path() -> PathBuf {
     base_dir().join("auth.json")
@@ -252,7 +260,7 @@ mod tests {
 
     #[test]
     fn resolve_for_provider_uses_shared_provider_env_map() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let _deepseek = EnvGuard::set("DEEPSEEK_API_KEY", "sk-deepseek-env");
         let _openai = EnvGuard::set("OPENAI_API_KEY", "sk-openai-should-not-count");
 

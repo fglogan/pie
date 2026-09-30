@@ -247,7 +247,8 @@ mod tests {
 
     #[test]
     fn try_layer_returns_none_when_env_unset() {
-        // SAFETY: tests share process state; explicitly clear the env var so this is
+        let _env = crate::auth::env_lock();
+        // SAFETY: serialized by `auth::ENV_LOCK`; explicitly clear the env var so this is
         // deterministic.
         unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
         assert!(try_layer().is_none());

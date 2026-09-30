@@ -116,6 +116,7 @@ mod tests {
 
     #[test]
     fn from_env_requires_project_and_one_auth_method() {
+        let _env = crate::test_env_lock();
         // Save / restore env state for determinism.
         let snapshot = [
             "GOOGLE_CLOUD_PROJECT",

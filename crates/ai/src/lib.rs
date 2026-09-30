@@ -44,3 +44,12 @@ pub use utils::event_stream::{
 pub use utils::json_parse::parse_partial_json;
 pub use utils::overflow::{ContextOverflow, is_context_overflow};
 pub use utils::validation::{ValidationError, ValidationResult, validate};
+
+/// Serializes unit tests that mutate process environment variables. `set_var`/`remove_var`
+/// race with concurrent `getenv` on other test threads (they are `unsafe` in Rust 2024 for
+/// that reason), so every env-mutating test in this crate must hold this lock.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}

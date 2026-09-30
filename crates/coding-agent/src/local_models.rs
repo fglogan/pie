@@ -141,15 +141,15 @@ mod tests {
         AssistantMessageEvent, Context as AiContext, DoneReason, Message, Tool, UserContent,
         UserMessage, UserRole,
     };
-    use std::sync::OnceLock;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::{Mutex as TokioMutex, oneshot};
+    use tokio::sync::oneshot;
 
-    fn env_lock() -> &'static TokioMutex<()> {
-        static LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| TokioMutex::new(()))
+    /// Shared with every other env-mutating test in this binary (see `auth::ENV_LOCK`); a
+    /// module-local lock would still race with them.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::auth::env_lock()
     }
 
     struct EnvGuard {
@@ -226,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn registers_ds4_model_from_explicit_env_url_and_allows_user_override() {
-        let _lock = env_lock().lock().await;
+        let _lock = env_lock();
         let _base_url = EnvGuard::set("DS4_BASE_URL", "http://127.0.0.1:8000/v1");
         let _legacy_url = EnvGuard::remove("DS4_URL");
         unregister_ds4_default();
@@ -267,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn ds4_url_env_alias_registers_model() {
-        let _lock = env_lock().lock().await;
+        let _lock = env_lock();
         let _base_url = EnvGuard::remove("DS4_BASE_URL");
         let _legacy_url = EnvGuard::set("DS4_URL", "http://127.0.0.1:8123/v1");
         unregister_ds4_default();
@@ -283,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_base_url_registers_ds4_model_and_overrides_env_url() {
-        let _lock = env_lock().lock().await;
+        let _lock = env_lock();
         let _base_url = EnvGuard::set("DS4_BASE_URL", "http://127.0.0.1:8000/v1");
         let _legacy_url = EnvGuard::remove("DS4_URL");
         unregister_ds4_default();
@@ -301,7 +301,7 @@ mod tests {
     fn loads_and_registers_custom_model() {
         // load_all_from_paths registers the ds4 default from DS4_* env vars, so every test
         // that calls it must hold env_lock or it races the env-guarded ds4 tests.
-        let _lock = env_lock().blocking_lock();
+        let _lock = env_lock();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("models.json");
         std::fs::write(
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn project_model_overrides_user_model_with_same_provider_and_id() {
-        let _lock = env_lock().blocking_lock();
+        let _lock = env_lock();
         let dir = TempDir::new().unwrap();
         let user = dir.path().join("user.json");
         let project = dir.path().join("project.json");
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn malformed_config_fails_closed_without_registering() {
-        let _lock = env_lock().blocking_lock();
+        let _lock = env_lock();
         let dir = TempDir::new().unwrap();
         let bad = dir.path().join("bad.json");
         std::fs::write(&bad, r#"{ "models": [ { "provider": "broken" } ] }"#).unwrap();
@@ -377,7 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn loaded_openai_responses_model_streams_text_from_local_fixture() {
-        let _lock = env_lock().lock().await;
+        let _lock = env_lock();
         let body = r#"data: {"type":"response.created","response":{"id":"resp_test","model":"model","output":[]}}
 
 data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_test","type":"message","status":"in_progress","role":"assistant","content":[]}}
@@ -428,7 +428,7 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
 
     #[tokio::test]
     async fn loaded_openai_responses_model_streams_tool_call_from_local_fixture() {
-        let _lock = env_lock().lock().await;
+        let _lock = env_lock();
         let body = r#"data: {"type":"response.created","response":{"id":"resp_test","model":"model","output":[]}}
 
 data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_test","type":"function_call","call_id":"call_1","name":"get_weather","arguments":""}}
@@ -498,7 +498,7 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
 
     #[tokio::test]
     async fn ds4_responses_model_uses_ds4_env_not_openai_env() {
-        let _lock = env_lock().lock().await;
+        let _lock = env_lock();
         let _openai = EnvGuard::set("OPENAI_API_KEY", "real-openai-should-not-leak");
         let _ds4 = EnvGuard::set("DS4_API_KEY", "dsv4-local");
         let _base_url = EnvGuard::remove("DS4_BASE_URL");
@@ -552,7 +552,7 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
 
     #[tokio::test]
     async fn ds4_env_without_url_reports_base_url_config() {
-        let _lock = env_lock().lock().await;
+        let _lock = env_lock();
         let _openai = EnvGuard::remove("OPENAI_API_KEY");
         let _anthropic = EnvGuard::remove("ANTHROPIC_API_KEY");
         let _ds4 = EnvGuard::set("DS4_API_KEY", "dsv4-local");
@@ -581,7 +581,7 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
 
     #[tokio::test]
     async fn ds4_responses_model_fails_closed_without_ds4_env_even_when_openai_env_exists() {
-        let _lock = env_lock().lock().await;
+        let _lock = env_lock();
         let _openai = EnvGuard::set("OPENAI_API_KEY", "real-openai-should-not-leak");
         let _ds4 = EnvGuard::remove("DS4_API_KEY");
         let _base_url = EnvGuard::remove("DS4_BASE_URL");

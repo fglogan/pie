@@ -204,6 +204,7 @@ mod tests {
 
     #[test]
     fn creds_from_env_returns_none_without_keys() {
+        let _env = crate::test_env_lock();
         // Save+restore to avoid leaking state to other tests.
         let prior_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let prior_sec = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
